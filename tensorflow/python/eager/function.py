@@ -21,7 +21,6 @@ from __future__ import print_function
 
 import collections
 import functools
-import re
 import threading
 import types as types_lib
 import weakref
@@ -60,13 +59,6 @@ from tensorflow.python.util import tf_inspect
 
 FORWARD_FUNCTION_ATTRIBUTE_NAME = "forward_function_name"
 BACKWARD_FUNCTION_ATTRIBUTE_NAME = "backward_function_name"
-
-# TODO(scottzhu): Update this to allow arbitrary attribute names in future.
-WHITELIST_FUNCTION_ATTRIBUTE_REGEX = [
-    "experimental_.*",
-    FORWARD_FUNCTION_ATTRIBUTE_NAME,
-    BACKWARD_FUNCTION_ATTRIBUTE_NAME
-]
 
 CacheKey = collections.namedtuple("CacheKey", [
     "input_signature", "parent_graph", "device_functions", "colocation_stack",
@@ -108,12 +100,6 @@ def _parse_func_attrs(attributes):
   """
   attrs = {}
   for key, value in attributes.items():
-    if not any(re.match(reg, key)
-               for reg in WHITELIST_FUNCTION_ATTRIBUTE_REGEX):
-      raise ValueError("Attribute name is not whitelisted. "
-                       "Whitelisted: prefix %s, got: %s" %
-                       (WHITELIST_FUNCTION_ATTRIBUTE_REGEX, key))
-
     if isinstance(value, attr_value_pb2.AttrValue):
       attrs[key] = value
     # bool type check has to happen before int since bool is a subclass of int.
@@ -431,13 +417,24 @@ class ConcreteFunction(object):
                args))
     args = list(args)
     for keyword in self._arg_keywords[len(args):]:
-      args.append(kwargs.pop(compat.as_str(keyword)))
+      try:
+        args.append(kwargs.pop(compat.as_str(keyword)))
+      except KeyError:
+        specified_keywords = (list(self._arg_keywords[:len(args)])
+                              + list(kwargs.keys()))
+        raise TypeError(
+            "Expected argument names {} but got values for {}. Missing: {}."
+            .format(
+                list(self._arg_keywords),
+                specified_keywords,
+                list(set(self._arg_keywords) - set(specified_keywords))))
     if kwargs:
       positional_arg_keywords = set(self._arg_keywords[:len(args)])
       for unused_key in kwargs:
         if unused_key in positional_arg_keywords:
           raise TypeError("Got two values for keyword '{}'.".format(unused_key))
-      raise TypeError("Keyword arguments {} unknown.".format(kwargs.keys()))
+      raise TypeError("Keyword arguments {} unknown. Expected {}.".format(
+          list(kwargs.keys()), list(self._arg_keywords)))
     return self._call_flat(args)
 
   def _filtered_call(self, args, kwargs):
@@ -847,6 +844,10 @@ class FunctionSpec(object):
       python_function_to_inspect = python_function.func
       args_to_prepend = python_function.args or tuple()
       kwargs_to_include = python_function.keywords or {}
+      if input_signature is not None:
+        # TODO(b/124441704): Add support for input_signature + partial.
+        raise NotImplementedError(
+            "Missing support for input_signature when using partial functions.")
     else:
       python_function_to_inspect = python_function
       args_to_prepend = tuple()
@@ -1033,7 +1034,8 @@ class Function(object):
                input_signature=None,
                attributes=None,
                autograph=True,
-               autograph_options=None):
+               autograph_options=None,
+               capture_by_value=None):
     """Initializes a `Function`.
 
     Args:
@@ -1050,6 +1052,9 @@ class Function(object):
       autograph_options: Experimental knobs to control behavior
         `when autograph=True`. See https://www.tensorflow.org/guide/autograph
         for more information.
+      capture_by_value: Experimental. Whether to capture resource variables by
+        value or reference. If None, will inherit from a parent context or
+        default to False.
 
     Raises:
       ValueError: if `input_signature` is not None and the `python_function`'s
@@ -1067,6 +1072,7 @@ class Function(object):
     self._function_cache = collections.OrderedDict()
     self._garbage_collector = _FunctionGarbageCollector(self._function_cache)
     self._function_attributes = attributes or {}
+    self._capture_by_value = capture_by_value
 
     self._lock = threading.Lock()
     # _descriptor_cache is a of instance of a class to an instance-specific
@@ -1329,13 +1335,15 @@ class Function(object):
                 self._input_signature,
                 autograph=self._autograph,
                 autograph_options=self._autograph_options,
-                arg_names=arg_names), self._function_attributes)
+                arg_names=arg_names,
+                capture_by_value=self._capture_by_value),
+            self._function_attributes)
         # pylint: disable=protected-access
         # Tell the ConcreteFunction to clean up its graph once it goes out of
         # scope. ConcreteFunction does not do this in its constructor since it
         # gets used in some places (like Keras) where the FuncGraph lives
         # longer than the ConcreteFunction.
-        graph_function._garbage_collector = _ConcreteFunctionGarbageCollector(
+        graph_function._garbage_collector = ConcreteFunctionGarbageCollector(
             graph_function.graph)
         # pylint: enable=protected-access
         self._function_cache[cache_key] = graph_function
@@ -1858,7 +1866,7 @@ class _FunctionGarbageCollector(object):
       pass
 
 
-class _ConcreteFunctionGarbageCollector(object):
+class ConcreteFunctionGarbageCollector(object):
   """Cleans up reference cycles when a `ConcreteFunction` goes out of scope."""
 
   def __init__(self, func_graph):
